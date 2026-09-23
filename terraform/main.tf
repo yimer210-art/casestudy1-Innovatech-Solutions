@@ -13,3 +13,8 @@ module "compute" {
   public_subnet_ids   = module.vpc_web.public_subnet_ids
   private_subnet_ids  = module.vpc_web.private_subnet_ids
 }
+
+module "vpc_data" {
+  source                 = "./modules/vpc-data"
+  db_password             = var.db_password
+}
