@@ -18,3 +18,9 @@ module "vpc_data" {
   source                 = "./modules/vpc-data"
   db_password             = var.db_password
 }
+
+module "vpc_hub" {
+  source             = "./modules/vpc-hub"
+  admin_cidr         = var.admin_cidr
+  bastion_public_key = var.bastion_public_key
+}
