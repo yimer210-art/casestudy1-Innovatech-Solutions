@@ -79,5 +79,39 @@ resource "aws_instance" "bastion" {
   vpc_security_group_ids = [aws_security_group.bastion.id]
   key_name               = aws_key_pair.bastion.key_name
 
+  iam_instance_profile   = aws_iam_instance_profile.bastion_profile.name
+
   tags = { Name = "bastion-hub" }
+}
+
+# --- NIEUWE IAM BLOKKEN VOOR DE CI/CD RUNNER ---
+
+# 1. De IAM rol die de Bastion (EC2) mag aannemen
+resource "aws_iam_role" "bastion_runner_role" {
+  name = "bastion-runner-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# 2. De rechten voor de rol (AdministratorAccess voor Terraform)
+resource "aws_iam_role_policy_attachment" "bastion_admin" {
+  role       = aws_iam_role.bastion_runner_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+}
+
+# 3. Het profiel dat we aan de EC2 instance hangen
+resource "aws_iam_instance_profile" "bastion_profile" {
+  name = "bastion-runner-profile"
+  role = aws_iam_role.bastion_runner_role.name
 }
