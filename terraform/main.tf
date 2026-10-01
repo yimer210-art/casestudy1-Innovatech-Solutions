@@ -3,7 +3,6 @@ terraform {
     bucket = "innovatech-tfstate-805778285824"
     key    = "terraform.tfstate"
     region = "eu-central-1"
-    profile = "terraform"
   }
 }
 
