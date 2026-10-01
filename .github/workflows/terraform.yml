@@ -40,8 +40,8 @@ jobs:
 
       # 5. Laat zien wat er gaat veranderen
       - name: Terraform Plan
-      # We geven de variabele direct mee. Vul hier eventueel je eigen IP in i.p.v. 0.0.0.0/0
-        run: terraform plan -var="admin_cidr=0.0.0.0/0"
+      
+        run: terraform plan 
 
       # 6. Voer de wijzigingen automatisch door (auto-approve is nodig omdat de robot niet op "yes" kan typen)
       - name: Terraform Apply
