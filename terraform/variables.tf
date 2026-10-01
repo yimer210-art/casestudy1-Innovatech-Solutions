@@ -10,3 +10,7 @@ variable "admin_cidr" {
 variable "bastion_public_key" {
   type = string
 }
+
+variable "hosted_zone_id" {
+  type = string
+}
