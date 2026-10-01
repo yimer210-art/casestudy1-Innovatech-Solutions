@@ -1,0 +1,43 @@
+name: 'Terraform CI/CD Pipeline'
+
+# Dit bepaalt WANNNEER de pipeline draait (zodra jij pusht naar de 'main' branch)
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  terraform:
+    name: 'Deploy Infrastructure'
+    # Dit is de belangrijkste regel: dit vertelt GitHub om jouw Bastion te gebruiken!
+    runs-on: self-hosted 
+
+    # Dit is de map waar jouw Terraform code staat
+    defaults:
+      run:
+        working-directory: ./terraform
+
+    steps:
+      # 1. Haal de laatste code op uit GitHub
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. Installeer Terraform op de Bastion
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      # 3. Initialiseer de S3 backend en modules
+      - name: Terraform Init
+        run: terraform init
+
+      # 4. Controleer of de code geldig is
+      - name: Terraform Validate
+        run: terraform validate
+
+      # 5. Laat zien wat er gaat veranderen
+      - name: Terraform Plan
+        run: terraform plan
+
+      # 6. Voer de wijzigingen automatisch door (auto-approve is nodig omdat de robot niet op "yes" kan typen)
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
