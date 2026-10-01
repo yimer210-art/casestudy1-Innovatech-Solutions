@@ -13,3 +13,7 @@ output "subnet_ids" {
 output "main_route_table_id" {
   value = aws_vpc.data.main_route_table_id
 }
+
+output "rds_identifier" {
+  value = aws_db_instance.postgres.identifier
+}

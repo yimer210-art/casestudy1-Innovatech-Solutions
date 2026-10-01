@@ -1,3 +1,11 @@
+terraform {
+  backend "s3" {
+    bucket = "innovatech-tfstate-805778285824"
+    key    = "terraform.tfstate"
+    region = "eu-central-1"
+  }
+}
+
 provider "aws" {
   region  = "eu-central-1"
   profile = "terraform"
@@ -41,9 +49,14 @@ module "transit_gateway" {
   hub_route_table_id = module.vpc_hub.route_table_id
 }
 
-module "dns" {
-  source         = "./modules/dns"
-  hosted_zone_id = var.hosted_zone_id
-  alb_dns_name   = module.compute.alb_dns_name
-  alb_zone_id    = module.compute.alb_zone_id
+module "monitoring" {
+  source = "./modules/monitoring"
+
+  # Haal deze waarden uit de outputs van je compute module
+  ecs_cluster_name = module.compute.ecs_cluster_name
+  ecs_service_name = module.compute.ecs_service_name
+  alb_arn_suffix   = module.compute.alb_arn_suffix
+  
+  # Haal deze waarde uit de output van je vpc-data / database module
+  rds_cluster_identifier = module.vpc_data.rds_identifier
 }

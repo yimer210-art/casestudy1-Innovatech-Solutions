@@ -1,3 +1,4 @@
+/*
 resource "aws_route53_record" "web" {
   zone_id = var.hosted_zone_id
   name    = "www.innovatech-tickets.nl"
@@ -9,3 +10,4 @@ resource "aws_route53_record" "web" {
     evaluate_target_health = true
   }
 }
+*/
