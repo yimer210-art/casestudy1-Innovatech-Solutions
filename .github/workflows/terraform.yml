@@ -16,6 +16,10 @@ jobs:
     defaults:
       run:
         working-directory: ./terraform
+      
+    env:
+      TF_VAR_admin_cidr: ${{ secrets.ADMIN_CIDR }}
+      TF_VAR_bastion_public_key: ${{ secrets.BASTION_PUBLIC_KEY }}
 
     steps:
       # 1. Haal de laatste code op uit GitHub
@@ -36,8 +40,9 @@ jobs:
 
       # 5. Laat zien wat er gaat veranderen
       - name: Terraform Plan
-        run: terraform plan
+      # We geven de variabele direct mee. Vul hier eventueel je eigen IP in i.p.v. 0.0.0.0/0
+        run: terraform plan -var="admin_cidr=0.0.0.0/0"
 
       # 6. Voer de wijzigingen automatisch door (auto-approve is nodig omdat de robot niet op "yes" kan typen)
       - name: Terraform Apply
-        run: terraform apply -auto-approve
+        run: terraform apply -auto-approve -var="admin_cidr=0.0.0.0/0"
