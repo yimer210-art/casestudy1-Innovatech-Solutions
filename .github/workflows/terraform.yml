@@ -40,6 +40,17 @@ jobs:
       - name: Terraform Validate
         run: terraform validate
 
+        # --- BEVEILIGINGSSCAN TOEVOEGEN ---
+      - name: Run Security Scan (tfsec)
+        run: |
+          # Installeer tfsec eenmalig als het nog niet aanwezig is
+          if ! command -v tfsec &> /dev/null; then
+            curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | sudo bash
+          fi
+          # Voer de scan uit op de huidige map
+          tfsec . --soft-fail
+      # ----------------------------------
+
       # 5. Laat zien wat er gaat veranderen
       - name: Terraform Plan
       
