@@ -20,6 +20,7 @@ jobs:
     env:
       TF_VAR_admin_cidr: ${{ secrets.ADMIN_CIDR }}
       TF_VAR_bastion_public_key: ${{ secrets.BASTION_PUBLIC_KEY }}
+      TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
 
     steps:
       # 1. Haal de laatste code op uit GitHub
