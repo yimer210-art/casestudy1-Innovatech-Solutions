@@ -9,7 +9,6 @@ terraform {
 
 provider "aws" {
   region  = "eu-central-1"
-  profile = "terraform"
 }
 
 module "vpc_web" {
