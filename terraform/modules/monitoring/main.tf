@@ -70,10 +70,83 @@ resource "aws_cloudwatch_metric_alarm" "alb_5xx_errors" {
   statistic           = "Sum"
   threshold           = 10 # Alarm gaat af bij meer dan 10 fouten in 1 minuut
   alarm_description   = "Dit alarm gaat af als de Load Balancer te veel 500-errors teruggeeft aan gebruikers."
-  
-  treat_missing_data  = "notBreaching"
-  
+
+  treat_missing_data = "notBreaching"
+
   dimensions = {
     LoadBalancer = var.alb_arn_suffix
   }
-}   
+}
+
+# 3. VPC Flow Logs (Logbron 2 - REQ-NCA-P2-07)
+resource "aws_cloudwatch_log_group" "vpc_flow_logs" {
+  name              = "/aws/vpc/innovatech-flow-logs"
+  retention_in_days = 7
+
+  tags = {
+    Name = "innovatech-vpc-flow-logs"
+  }
+}
+
+resource "aws_iam_role" "vpc_flow_logs" {
+  name = "innovatech-vpc-flow-logs-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "vpc-flow-logs.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "vpc_flow_logs" {
+  name = "innovatech-vpc-flow-logs-policy"
+  role = aws_iam_role.vpc_flow_logs.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:DescribeLogGroups",
+          "logs:DescribeLogStreams"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_flow_log" "security" {
+  iam_role_arn             = aws_iam_role.vpc_flow_logs.arn
+  log_destination          = aws_cloudwatch_log_group.vpc_flow_logs.arn
+  traffic_type             = "ALL"
+  max_aggregation_interval = 60
+  vpc_id                   = var.security_vpc_id
+
+  tags = {
+    Name = "flow-log-vpc-security"
+  }
+}
+
+resource "aws_flow_log" "branch" {
+  iam_role_arn             = aws_iam_role.vpc_flow_logs.arn
+  log_destination          = aws_cloudwatch_log_group.vpc_flow_logs.arn
+  traffic_type             = "ALL"
+  max_aggregation_interval = 60
+  vpc_id                   = var.branch_vpc_id
+
+  tags = {
+    Name = "flow-log-vpc-branch"
+  }
+}

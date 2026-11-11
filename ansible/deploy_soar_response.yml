@@ -1,0 +1,640 @@
+---
+- name: Deploy Innovatech SOAR Active Responder (sec-monitoring-soar)
+  hosts: security
+  become: true
+  vars:
+    soar_dir: /opt/security-stack/shuffle
+    soar_responder_port: 5002
+    default_shuffle_webhook_url: "http://127.0.0.1:5001/api/v1/hooks/webhook_8e00185a-5cf7-4432-8d57-11a8b4846e38"
+
+  handlers:
+    - name: Restart soar-responder
+      ansible.builtin.systemd:
+        name: soar-responder
+        state: restarted
+        daemon_reload: true
+
+  tasks:
+    - name: Ensure openssh-client and python3 are installed
+      ansible.builtin.apt:
+        name:
+          - openssh-client
+          - python3
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Ensure /home/ubuntu/.ssh directory exists
+      ansible.builtin.file:
+        path: /home/ubuntu/.ssh
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0700"
+
+    - name: Generate dedicated SOAR mitigation SSH ED25519 keypair
+      ansible.builtin.command:
+        cmd: ssh-keygen -t ed25519 -N "" -C "innovatech-soar-mitigation" -f /home/ubuntu/.ssh/soar_mitigation_key
+        creates: /home/ubuntu/.ssh/soar_mitigation_key
+      become_user: ubuntu
+
+    - name: Ensure strict permissions on SOAR mitigation SSH key files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        owner: ubuntu
+        group: ubuntu
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: /home/ubuntu/.ssh/soar_mitigation_key, mode: "0600" }
+        - { path: /home/ubuntu/.ssh/soar_mitigation_key.pub, mode: "0644" }
+
+    - name: Read SOAR mitigation SSH public key
+      ansible.builtin.slurp:
+        src: /home/ubuntu/.ssh/soar_mitigation_key.pub
+      register: soar_pubkey_b64
+
+    - name: Ensure SOAR security stack directory exists
+      ansible.builtin.file:
+        path: "{{ soar_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Configure SOAR responder environment file
+      ansible.builtin.copy:
+        dest: "{{ soar_dir }}/soar-responder.env"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          SOAR_RESPONDER_PORT={{ soar_responder_port }}
+          SOAR_SSH_KEY=/home/ubuntu/.ssh/soar_mitigation_key
+          SOAR_KNOWN_HOSTS=/home/ubuntu/.ssh/soar_known_hosts
+          SHUFFLE_WEBHOOK_URL={{ default_shuffle_webhook_url }}
+      notify: Restart soar-responder
+
+    - name: Deploy soar_responder.py active mitigation webhook receiver
+      ansible.builtin.copy:
+        dest: "{{ soar_dir }}/soar_responder.py"
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/usr/bin/env python3
+          """Innovatech SOAR Active Responder.
+
+          Receives security alerts over HTTP, verifies strict IPv4 format and
+          infrastructure safety whitelists, enforces sub-3s iptables DROP on the
+          victim node over SSH, and forwards incident context to Shuffle SOAR.
+          """
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          import ipaddress
+          import json
+          import logging
+          import os
+          import subprocess
+          import sys
+          import threading
+          import time
+          import urllib.request
+
+          PORT = int(os.environ.get("SOAR_RESPONDER_PORT", "5002"))
+          SSH_KEY = os.environ.get("SOAR_SSH_KEY", "/home/ubuntu/.ssh/soar_mitigation_key")
+          KNOWN_HOSTS = os.environ.get("SOAR_KNOWN_HOSTS", "/home/ubuntu/.ssh/soar_known_hosts")
+          SHUFFLE_WEBHOOK_URL = os.environ.get("SHUFFLE_WEBHOOK_URL", "").strip()
+          STATE_FILE = os.environ.get("SOAR_STATE_FILE", "/home/ubuntu/.soar_mitigations_count")
+          COUNT_LOCK = threading.Lock()
+
+          def get_mitigations_count() -> int:
+              try:
+                  with open(STATE_FILE, "r", encoding="utf-8") as f:
+                      return int(f.read().strip() or "0")
+              except Exception:
+                  return 0
+
+          def increment_mitigations_count() -> int:
+              with COUNT_LOCK:
+                  new_val = get_mitigations_count() + 1
+                  try:
+                      with open(STATE_FILE, "w", encoding="utf-8") as f:
+                          f.write(str(new_val))
+                  except Exception as exc:
+                      log.warning("Failed persisting mitigation count: %s", exc)
+                  return new_val
+
+          WHITELIST_NETS = [
+              ipaddress.ip_network("127.0.0.0/8"),   # Loopback
+              ipaddress.ip_network("10.0.0.0/16"),   # VPC Web
+              ipaddress.ip_network("10.1.0.0/16"),   # VPC Data
+              ipaddress.ip_network("10.2.0.0/16"),   # VPC Hub / Bastion (10.2.1.171)
+              ipaddress.ip_network("10.3.0.0/16"),   # VPC Security / Monitoring & SOAR (10.3.1.50)
+          ]
+          ALLOWED_TARGET_NETS = [
+              ipaddress.ip_network("192.168.56.0/24"),  # Branch Office Subnet
+          ]
+
+          logging.basicConfig(
+              level=logging.INFO,
+              format="%(asctime)s [SOAR-RESPONDER] %(levelname)s %(message)s",
+              stream=sys.stdout,
+          )
+          log = logging.getLogger("soar-responder")
+
+
+          def is_whitelisted(ip_obj: ipaddress.IPv4Address) -> bool:
+              return any(ip_obj in net for net in WHITELIST_NETS)
+
+
+          def is_allowed_target(ip_obj: ipaddress.IPv4Address) -> bool:
+              return any(ip_obj in net for net in ALLOWED_TARGET_NETS)
+
+
+          def discover_shuffle_webhook() -> str:
+              """Fallback lookup for active Shuffle webhook via local OpenSearch."""
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:9200/hooks/_search?size=10", timeout=2) as r:
+                      data = json.loads(r.read().decode("utf-8"))
+                  for hit in data.get("hits", {}).get("hits", []):
+                      src = hit.get("_source", {})
+                      if src.get("type") == "webhook" and src.get("status") == "running":
+                          hook_id = src.get("id") or hit.get("_id", "")
+                          if hook_id:
+                              return f"http://127.0.0.1:5001/api/v1/hooks/{hook_id}"
+              except Exception as exc:
+                  log.warning("Shuffle webhook auto-discovery failed: %s", exc)
+              return ""
+
+
+          def forward_to_shuffle(payload: dict) -> None:
+              urls = []
+              if SHUFFLE_WEBHOOK_URL:
+                  urls.append(SHUFFLE_WEBHOOK_URL)
+              body = json.dumps(payload).encode("utf-8")
+              headers = {"Content-Type": "application/json", "User-Agent": "Innovatech-SOAR-Responder/1.0"}
+
+              for url in urls:
+                  try:
+                      req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+                      with urllib.request.urlopen(req, timeout=5) as resp:
+                          log.info("Shuffle SOAR notified (%s): HTTP %s", url, resp.status)
+                          return
+                  except Exception as exc:
+                      log.warning("Shuffle webhook POST failed (%s): %s", url, exc)
+
+              discovered = discover_shuffle_webhook()
+              if discovered and discovered not in urls:
+                  try:
+                      req = urllib.request.Request(discovered, data=body, headers=headers, method="POST")
+                      with urllib.request.urlopen(req, timeout=5) as resp:
+                          log.info("Shuffle SOAR notified via auto-discovered hook (%s): HTTP %s", discovered, resp.status)
+                  except Exception as exc:
+                      log.warning("Auto-discovered Shuffle webhook POST failed: %s", exc)
+
+
+          def apply_remote_iptables_drop(source_ip: str, target_ip: str) -> tuple[bool, str, int]:
+              start = time.monotonic()
+              remote_cmd = (
+                  f"(sudo iptables -C INPUT -s {source_ip}/32 -j DROP -m comment --comment SOAR_Mitigation 2>/dev/null "
+                  f"|| sudo iptables -I INPUT 1 -s {source_ip}/32 -j DROP -m comment --comment SOAR_Mitigation) "
+                  f"&& logger -t SOAR-MITIGATION -p authpriv.warning "
+                  f"'SOAR Active Response: iptables DROP applied for {source_ip} via 10.3.1.50'"
+              )
+              cmd = [
+                  "ssh",
+                  "-i", SSH_KEY,
+                  "-o", "BatchMode=yes",
+                  "-o", "StrictHostKeyChecking=accept-new",
+                  "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+                  "-o", "ConnectTimeout=3",
+                  f"ubuntu@{target_ip}",
+                  remote_cmd,
+              ]
+              proc = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
+              elapsed_ms = int((time.monotonic() - start) * 1000)
+              if proc.returncode != 0:
+                  err = (proc.stderr or proc.stdout or "unknown ssh error").strip()
+                  return False, err, elapsed_ms
+              return True, "applied", elapsed_ms
+
+
+          class ResponderHandler(BaseHTTPRequestHandler):
+              def log_message(self, fmt, *args):
+                  return  # Handled via structured logger
+
+              def _send_json(self, status: int, body: dict):
+                  raw = json.dumps(body).encode("utf-8")
+                  self.send_response(status)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(raw)))
+                  self.end_headers()
+                  self.wfile.write(raw)
+
+              def do_GET(self):
+                  if self.path.rstrip("/") == "/health":
+                      self._send_json(200, {
+                          "status": "ok",
+                          "service": "innovatech-soar-responder",
+                          "mitigations_total": get_mitigations_count(),
+                      })
+                      return
+                  self._send_json(404, {"error": "not found"})
+
+              def do_POST(self):
+                  try:
+                      length = int(self.headers.get("Content-Length", "0"))
+                      raw = self.rfile.read(min(length, 65536))
+                      payload = json.loads(raw.decode("utf-8"))
+                  except Exception as exc:
+                      self._send_json(400, {"error": f"invalid json: {exc}"})
+                      return
+
+                  try:
+                      src_obj = ipaddress.IPv4Address(str(payload.get("source_ip", "")).strip())
+                      tgt_obj = ipaddress.IPv4Address(str(payload.get("target_ip", "")).strip())
+                  except Exception:
+                      self._send_json(400, {"error": "source_ip and target_ip must be valid IPv4 addresses"})
+                      return
+
+                  src_str = str(src_obj)
+                  tgt_str = str(tgt_obj)
+
+                  if src_obj == tgt_obj or is_whitelisted(src_obj):
+                      log.info("Ignored whitelisted/self source_ip=%s for target=%s", src_str, tgt_str)
+                      self._send_json(200, {"status": "ignored", "reason": "whitelisted_or_self", "source_ip": src_str})
+                      return
+
+                  if not is_allowed_target(tgt_obj):
+                      log.warning("Rejected target_ip=%s outside branch network", tgt_str)
+                      self._send_json(403, {"error": "target_ip outside managed branch range"})
+                      return
+
+                  try:
+                      ok, detail, elapsed_ms = apply_remote_iptables_drop(src_str, tgt_str)
+                  except Exception as exc:
+                      log.error("Mitigation exception for %s -> %s: %s", src_str, tgt_str, exc)
+                      self._send_json(500, {"status": "error", "detail": str(exc)})
+                      return
+
+                  event_enriched = dict(payload)
+                  event_enriched.setdefault("anomaly_type", str(payload.get("event", "ssh_brute_force")))
+                  event_enriched["soar_action"] = "iptables DROP" if ok else "failed"
+                  event_enriched["mitigation_latency_ms"] = elapsed_ms
+
+                  if ok:
+                      mitigations_total = increment_mitigations_count()
+                      threading.Thread(target=forward_to_shuffle, args=(event_enriched,), daemon=True).start()
+                      log.info("MITIGATION OK (#%d): blocked %s on %s in %d ms", mitigations_total, src_str, tgt_str, elapsed_ms)
+                      self._send_json(200, {
+                          "status": "mitigated",
+                          "source_ip": src_str,
+                          "target_ip": tgt_str,
+                          "latency_ms": elapsed_ms,
+                          "mitigations_total": mitigations_total,
+                          "comment": "SOAR_Mitigation",
+                      })
+                  else:
+                      threading.Thread(target=forward_to_shuffle, args=(event_enriched,), daemon=True).start()
+                      log.error("MITIGATION FAILED (%s on %s, %d ms): %s", src_str, tgt_str, elapsed_ms, detail)
+                      self._send_json(502, {
+                          "status": "mitigation_failed",
+                          "source_ip": src_str,
+                          "target_ip": tgt_str,
+                          "latency_ms": elapsed_ms,
+                          "detail": detail,
+                      })
+
+
+          if __name__ == "__main__":
+              server = ThreadingHTTPServer(("0.0.0.0", PORT), ResponderHandler)
+              log.info("Listening on 0.0.0.0:%d (key=%s)", PORT, SSH_KEY)
+              server.serve_forever()
+      notify: Restart soar-responder
+
+    - name: Configure soar-responder systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/soar-responder.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Innovatech SOAR Active Responder (iptables SSH + Shuffle Forwarder)
+          After=network-online.target docker.service
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=ubuntu
+          Group=ubuntu
+          EnvironmentFile={{ soar_dir }}/soar-responder.env
+          ExecStart=/usr/bin/python3 {{ soar_dir }}/soar_responder.py
+          Restart=always
+          RestartSec=3
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart soar-responder
+
+    - name: Ensure soar-responder service is enabled and running
+      ansible.builtin.systemd:
+        name: soar-responder
+        enabled: true
+        state: started
+        daemon_reload: true
+
+- name: Deploy Auth Monitor & SOAR Enforcement Hooks on Workstation-01
+  hosts: workstation-01
+  become: true
+  vars:
+    soar_webhook_url: "http://soar.innovatech.internal:5002/webhook"
+
+  handlers:
+    - name: Restart auth-monitor
+      ansible.builtin.systemd:
+        name: auth-monitor
+        state: restarted
+        daemon_reload: true
+
+  tasks:
+    - name: Ensure python3 and iptables are present
+      ansible.builtin.apt:
+        name:
+          - python3
+          - iptables
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Ensure /home/ubuntu/.ssh directory exists
+      ansible.builtin.file:
+        path: /home/ubuntu/.ssh
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0700"
+
+    - name: Authorize SOAR responder public key on workstation-01
+      ansible.builtin.lineinfile:
+        path: /home/ubuntu/.ssh/authorized_keys
+        line: "{{ hostvars['sec-monitoring-soar']['soar_pubkey_b64']['content'] | b64decode | trim }}"
+        create: true
+        owner: ubuntu
+        group: ubuntu
+        mode: "0600"
+
+    - name: Allow ubuntu user passwordless sudo for iptables and logger
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/soar-iptables
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "visudo -cf %s"
+        content: |
+          ubuntu ALL=(ALL) NOPASSWD: /usr/sbin/iptables, /sbin/iptables, /usr/bin/logger
+
+    - name: Stop fail2ban if present so SOAR handles mitigation cleanly
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Ensure /var/log/auth.log exists with readable permissions
+      ansible.builtin.file:
+        path: /var/log/auth.log
+        state: touch
+        mode: "0644"
+        modification_time: preserve
+        access_time: preserve
+
+    - name: Deploy /usr/local/bin/auth_monitor.py
+      ansible.builtin.copy:
+        dest: /usr/local/bin/auth_monitor.py
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/usr/bin/env python3
+          """Innovatech Branch Office Auth Monitor.
+
+          Tails /var/log/auth.log for SSH brute-force events (Failed password/publickey,
+          Invalid user, and preauth auth failures), enforces infrastructure whitelists,
+          and dispatches sub-3s active mitigation alerts to the SOAR responder.
+          """
+          from collections import defaultdict, deque
+          import ipaddress
+          import json
+          import os
+          import re
+          import socket
+          import sys
+          import syslog
+          import time
+          import urllib.parse
+          import urllib.request
+
+          LOG_PATH = os.environ.get("AUTH_LOG_PATH", "/var/log/auth.log")
+          SOAR_URL = os.environ.get("SOAR_WEBHOOK_URL", "http://soar.innovatech.internal:5002/webhook")
+          THRESHOLD = int(os.environ.get("BRUTEFORCE_THRESHOLD", "3"))
+          WINDOW_SECONDS = int(os.environ.get("BRUTEFORCE_WINDOW", "30"))
+          COOLDOWN_SECONDS = int(os.environ.get("BRUTEFORCE_COOLDOWN", "60"))
+
+          PATTERNS = [
+              re.compile(r"Failed (?:password|publickey) for (?:invalid user )?\S+ from (\d{1,3}(?:\.\d{1,3}){3})\b"),
+              re.compile(r"\bInvalid user \S+ from (\d{1,3}(?:\.\d{1,3}){3})\b"),
+              re.compile(r"Connection closed by authenticating user \S+ (\d{1,3}(?:\.\d{1,3}){3}) port \d+"),
+          ]
+
+          WHITELIST_NETS = [
+              ipaddress.ip_network("127.0.0.0/8"),   # Loopback
+              ipaddress.ip_network("10.0.0.0/16"),   # Web VPC
+              ipaddress.ip_network("10.1.0.0/16"),   # Data VPC
+              ipaddress.ip_network("10.2.0.0/16"),   # Hub VPC / Bastion
+              ipaddress.ip_network("10.3.0.0/16"),   # Security VPC / SOAR & Prometheus
+          ]
+
+
+          def get_local_ip(target_url: str) -> str:
+              try:
+                  parsed = urllib.parse.urlparse(target_url)
+                  host = parsed.hostname or "10.3.1.50"
+                  port = parsed.port or 5002
+                  with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                      sock.connect((host, port))
+                      return sock.getsockname()[0]
+              except Exception:
+                  return "192.168.56.10"
+
+
+          def emit_log(msg: str, priority: int = syslog.LOG_NOTICE) -> None:
+              print(msg, flush=True)
+              try:
+                  syslog.syslog(syslog.LOG_AUTHPRIV | priority, msg)
+              except Exception:
+                  pass
+
+
+          def is_whitelisted(ip_str: str, self_ip: str) -> bool:
+              if ip_str == self_ip:
+                  return True
+              try:
+                  ip_obj = ipaddress.IPv4Address(ip_str)
+              except Exception:
+                  return True
+              return any(ip_obj in net for net in WHITELIST_NETS)
+
+
+          def extract_source_ip(line: str):
+              for pat in PATTERNS:
+                  m = pat.search(line)
+                  if m:
+                      return m.group(1)
+              return None
+
+
+          def trigger_soar(source_ip: str, target_ip: str, attempts: int) -> None:
+              payload = {
+                  "event": "ssh_brute_force",
+                  "anomaly_type": "ssh_brute_force",
+                  "severity": "high",
+                  "source_ip": source_ip,
+                  "target_ip": target_ip,
+                  "target_host": socket.gethostname(),
+                  "attempts": attempts,
+                  "mitigation": "iptables_drop",
+              }
+              body = json.dumps(payload).encode("utf-8")
+              req = urllib.request.Request(
+                  SOAR_URL,
+                  data=body,
+                  headers={"Content-Type": "application/json"},
+                  method="POST",
+              )
+              t0 = time.monotonic()
+              try:
+                  with urllib.request.urlopen(req, timeout=5) as resp:
+                      resp_body = resp.read().decode("utf-8", errors="replace").strip()
+                      rtt_ms = int((time.monotonic() - t0) * 1000)
+                      emit_log(
+                          f"[AUTH MONITOR] [SOAR RESPONSE] HTTP {resp.status} in {rtt_ms} ms -> {resp_body}",
+                          syslog.LOG_WARNING,
+                      )
+              except Exception as exc:
+                  rtt_ms = int((time.monotonic() - t0) * 1000)
+                  emit_log(
+                      f"[AUTH MONITOR] [SOAR ERROR] Webhook failed after {rtt_ms} ms: {exc}",
+                      syslog.LOG_ERR,
+                  )
+
+
+          def main() -> None:
+              syslog.openlog("AUTH-MONITOR", syslog.LOG_PID, syslog.LOG_AUTHPRIV)
+              self_ip = get_local_ip(SOAR_URL)
+              emit_log(
+                  f"[AUTH MONITOR] Gestart op {socket.gethostname()} ({self_ip}), "
+                  f"threshold={THRESHOLD}/{WINDOW_SECONDS}s, target={SOAR_URL}"
+              )
+
+              attempts: dict[str, deque[float]] = defaultdict(deque)
+              cooldowns: dict[str, float] = {}
+
+              while not os.path.exists(LOG_PATH):
+                  time.sleep(0.5)
+
+              f = open(LOG_PATH, "r", encoding="utf-8", errors="replace")
+              f.seek(0, os.SEEK_END)
+              current_ino = os.fstat(f.fileno()).st_ino
+
+              while True:
+                  line = f.readline()
+                  if not line:
+                      time.sleep(0.1)
+                      try:
+                          st = os.stat(LOG_PATH)
+                          if st.st_ino != current_ino or f.tell() > st.st_size:
+                              f.close()
+                              f = open(LOG_PATH, "r", encoding="utf-8", errors="replace")
+                              current_ino = os.fstat(f.fileno()).st_ino
+                      except FileNotFoundError:
+                          pass
+                      continue
+
+                  src_ip = extract_source_ip(line)
+                  if not src_ip:
+                      continue
+
+                  if is_whitelisted(src_ip, self_ip):
+                      continue
+
+                  now = time.monotonic()
+                  q = attempts[src_ip]
+                  q.append(now)
+                  cutoff = now - WINDOW_SECONDS
+                  while q and q[0] < cutoff:
+                      q.popleft()
+
+                  count = len(q)
+                  emit_log(f"[AUTH MONITOR] Poging {count}/{THRESHOLD} vanaf {src_ip}", syslog.LOG_WARNING)
+
+                  last_trigger = cooldowns.get(src_ip, 0.0)
+                  if count >= THRESHOLD and (now - last_trigger) >= COOLDOWN_SECONDS:
+                      cooldowns[src_ip] = now
+                      q.clear()
+                      emit_log(
+                          f"[AUTH MONITOR] [BRUTE FORCE DETECTEERD] IP {src_ip} "
+                          f"({count} mislukte pogingen binnen {WINDOW_SECONDS}s) -> [SOAR TRIGGERED]",
+                          syslog.LOG_ALERT,
+                      )
+                      trigger_soar(src_ip, self_ip, count)
+
+
+          if __name__ == "__main__":
+              main()
+      notify: Restart auth-monitor
+
+    - name: Configure auth-monitor systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/auth-monitor.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Innovatech Auth Monitor (Event-Driven SSH Brute-Force Detector -> SOAR)
+          After=network-online.target rsyslog.service
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          Environment="SOAR_WEBHOOK_URL={{ soar_webhook_url }}"
+          ExecStart=/usr/bin/python3 /usr/local/bin/auth_monitor.py
+          Restart=always
+          RestartSec=2
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart auth-monitor
+
+    - name: Ensure auth-monitor service is enabled and running
+      ansible.builtin.systemd:
+        name: auth-monitor
+        enabled: true
+        state: started
+        daemon_reload: true
+
+- name: Verify End-to-End SOAR SSH Control Channel
+  hosts: security
+  become: true
+  tasks:
+    - name: Pre-populate known_hosts and verify SOAR -> Workstation-01 sudo iptables channel
+      ansible.builtin.command:
+        cmd: >
+          ssh -i /home/ubuntu/.ssh/soar_mitigation_key
+          -o BatchMode=yes
+          -o StrictHostKeyChecking=accept-new
+          -o UserKnownHostsFile=/home/ubuntu/.ssh/soar_known_hosts
+          -o ConnectTimeout=5
+          ubuntu@192.168.56.10
+          "sudo -n iptables -L INPUT -n >/dev/null && echo SOAR_CONTROL_CHANNEL_OK"
+      become_user: ubuntu
+      changed_when: false
+      register: channel_check
+
+    - name: Display control channel verification output
+      ansible.builtin.debug:
+        var: channel_check.stdout

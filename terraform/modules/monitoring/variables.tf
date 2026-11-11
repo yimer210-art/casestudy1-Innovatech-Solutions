@@ -17,3 +17,13 @@ variable "rds_cluster_identifier" {
   description = "De identifier van de RDS database"
   type        = string
 }
+
+variable "security_vpc_id" {
+  description = "VPC ID van Spoke 3 (Security) voor VPC Flow Logs"
+  type        = string
+}
+
+variable "branch_vpc_id" {
+  description = "VPC ID van Spoke 4 (Branch Office) voor VPC Flow Logs"
+  type        = string
+}
