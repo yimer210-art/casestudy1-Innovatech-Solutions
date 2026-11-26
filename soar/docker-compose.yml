@@ -1,0 +1,117 @@
+version: '3.8'
+
+services:
+  # Shuffle Frontend (UI)
+  frontend:
+    image: ghcr.io/shuffle/shuffle-frontend:latest
+    container_name: shuffle-frontend
+    hostname: shuffle-frontend
+    restart: unless-stopped
+    ports:
+      - "3443:80"
+    environment:
+      - BACKEND_HOSTNAME=shuffle-backend
+    networks:
+      - shuffle-net
+    depends_on:
+      - backend
+
+  # Shuffle Backend (API & Webhook Ingestion)
+  backend:
+    image: ghcr.io/shuffle/shuffle-backend:latest
+    container_name: shuffle-backend
+    hostname: shuffle-backend
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    environment:
+      - SHUFFLE_APP_HOTLOAD_FOLDER=/shuffle-apps
+      - SHUFFLE_FILE_LOCATION=/shuffle-files
+      - SHUFFLE_OPENSEARCH_URL=http://opensearch:9200
+      - SHUFFLE_SWARM_CONFIG=run
+      - ORG_ID=innovatech
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - shuffle-apps:/shuffle-apps
+      - shuffle-files:/shuffle-files
+    networks:
+      - shuffle-net
+    depends_on:
+      - opensearch
+
+  # Shuffle Orborus (Workflow Execution Engine)
+  orborus:
+    image: ghcr.io/shuffle/shuffle-orborus:latest
+    container_name: shuffle-orborus
+    hostname: shuffle-orborus
+    restart: unless-stopped
+    environment:
+      - SHUFFLE_APP_SDK_TIMEOUT=300
+      - SHUFFLE_BASE_IMAGE_NAME=shuffle
+      - BASE_URL=http://shuffle-backend:5001
+      - DOCKER_API_VERSION=1.40
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - shuffle-net
+    depends_on:
+      - backend
+
+  # OpenSearch Database for Shuffle state & execution logs
+  opensearch:
+    image: opensearchproject/opensearch:2.12.0
+    container_name: shuffle-opensearch
+    hostname: opensearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - "DISABLE_INSTALL_DEMO_CONFIG=true"
+      - "DISABLE_SECURITY_PLUGIN=true"
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - shuffle-database:/usr/share/opensearch/data
+    networks:
+      - shuffle-net
+
+  # Observability Stack: Grafana Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - shuffle-net
+
+  # Observability Stack: Prometheus Metrics Server
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    networks:
+      - shuffle-net
+
+  # Observability Stack: Grafana Loki Log Ingestion
+  loki:
+    image: grafana/loki:2.9.4
+    container_name: loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    networks:
+      - shuffle-net
+
+volumes:
+  shuffle-apps:
+  shuffle-files:
+  shuffle-database:
+
+networks:
+  shuffle-net:
+    driver: bridge
