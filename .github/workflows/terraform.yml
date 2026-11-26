@@ -60,3 +60,10 @@ jobs:
       # 6. Voer de wijzigingen automatisch door (auto-approve is nodig omdat de robot niet op "yes" kan typen)
       - name: Terraform Apply
         run: terraform apply -auto-approve -var="admin_cidr=0.0.0.0/0"
+
+      # 7. Configureer de machines met Ansible (SOAR & Auth Monitor)
+      - name: Run Ansible SOAR Deployment
+        working-directory: ./ansible
+        run: |
+          ansible-playbook -i hosts.ini deploy_soar_response.yml
+
