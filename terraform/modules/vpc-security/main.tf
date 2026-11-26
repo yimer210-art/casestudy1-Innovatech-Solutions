@@ -30,14 +30,15 @@ resource "aws_subnet" "security" {
 resource "aws_route_table" "security" {
   vpc_id = aws_vpc.security.id
 
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.security.id
-  }
-
   tags = {
     Name = "rt-sec-monitoring"
   }
+}
+
+resource "aws_route" "security_default" {
+  route_table_id         = aws_route_table.security.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.security.id
 }
 
 resource "aws_route_table_association" "security" {

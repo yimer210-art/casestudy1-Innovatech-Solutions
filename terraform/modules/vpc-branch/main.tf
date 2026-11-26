@@ -30,14 +30,15 @@ resource "aws_subnet" "branch" {
 resource "aws_route_table" "branch" {
   vpc_id = aws_vpc.branch.id
 
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.branch.id
-  }
-
   tags = {
     Name = "rt-branch-lan"
   }
+}
+
+resource "aws_route" "branch_default" {
+  route_table_id         = aws_route_table.branch.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.branch.id
 }
 
 resource "aws_route_table_association" "branch" {

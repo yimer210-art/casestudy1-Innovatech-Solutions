@@ -23,12 +23,13 @@ resource "aws_subnet" "mgmt" {
 resource "aws_route_table" "mgmt" {
   vpc_id = aws_vpc.hub.id
 
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.hub.id
-  }
-
   tags = { Name = "rt-mgmt-hub" }
+}
+
+resource "aws_route" "mgmt_default" {
+  route_table_id         = aws_route_table.mgmt.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.hub.id
 }
 
 resource "aws_route_table_association" "mgmt" {
