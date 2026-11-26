@@ -432,8 +432,8 @@
 
           LOG_PATH = os.environ.get("AUTH_LOG_PATH", "/var/log/auth.log")
           SOAR_URL = os.environ.get("SOAR_WEBHOOK_URL", "http://soar.innovatech.internal:5002/webhook")
-          THRESHOLD = int(os.environ.get("BRUTEFORCE_THRESHOLD", "5"))
-          WINDOW_SECONDS = int(os.environ.get("BRUTEFORCE_WINDOW", "60"))
+          THRESHOLD = int(os.environ.get("BRUTEFORCE_THRESHOLD", "3"))
+          WINDOW_SECONDS = int(os.environ.get("BRUTEFORCE_WINDOW", "30"))
           COOLDOWN_SECONDS = int(os.environ.get("BRUTEFORCE_COOLDOWN", "60"))
 
           PATTERNS = [
